@@ -1374,6 +1374,44 @@ func TestEncodedObjectSize_Packed(t *testing.T) {
 	assert.Greater(t, size, int64(0))
 }
 
+// TestEncodedObjectSize_CorruptLooseObject_DoesNotLeakFD guards against
+// a regression where encodedObjectSizeFromUnpacked opened the loose
+// object file but returned early -- without closing it -- when
+// objfile.NewReader failed to parse its header (e.g. invalid zlib
+// stream). See the corresponding fix in object.go.
+func TestEncodedObjectSize_CorruptLooseObject_DoesNotLeakFD(t *testing.T) {
+	fs := osfs.New(t.TempDir())
+	o := NewStorage(fs, cache.NewObjectLRUDefault())
+	require.NoError(t, o.Init())
+	t.Cleanup(func() { _ = o.Close() })
+
+	obj := o.NewEncodedObject()
+	obj.SetType(plumbing.BlobObject)
+	writer, err := obj.Writer()
+	require.NoError(t, err)
+	_, err = writer.Write([]byte("not actually used, overwritten below\n"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	hash, err := o.SetEncodedObject(obj)
+	require.NoError(t, err)
+
+	// Overwrite the now-written loose object file on disk with bytes
+	// that are not a valid zlib stream, so objfile.NewReader fails
+	// when EncodedObjectSize tries to read the header.
+	objPath := filepath.Join(fs.Root(), "objects", hash.String()[:2], hash.String()[2:])
+	require.NoError(t, os.WriteFile(objPath, []byte("not zlib data"), 0o644))
+
+	before := openFDCount(t)
+
+	_, err = o.EncodedObjectSize(hash)
+	require.Error(t, err, "expected EncodedObjectSize to fail on a corrupt loose object")
+
+	after := openFDCount(t)
+	assert.Equal(t, before, after,
+		"EncodedObjectSize leaked a file descriptor on the objfile.NewReader error path")
+}
+
 func TestFindObjectInPackfile_MRU_SeedsAndUses(t *testing.T) {
 	t.Parallel()
 	fixture := fixtures.Basic().One()
